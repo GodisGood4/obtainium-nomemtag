@@ -1,0 +1,255 @@
+name: Sync upstream release and build
+
+# Watches ImranR98/Obtainium for new releases. For each one, builds the same
+# tag with android:memtagMode removed from the manifest, signs the APKs with
+# this repository's own key and publishes them as a release of this repository.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream tag to build (default, latest upstream release)
+        type: string
+        required: false
+      force:
+        description: Rebuild even if this repo already has that release
+        type: boolean
+        default: false
+
+env:
+  UPSTREAM: ImranR98/Obtainium
+
+concurrency:
+  group: sync-build
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - name: Resolve upstream tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          TAG="$INPUT_TAG"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          fi
+          if ! [[ "$TAG" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]; then
+            echo "::error::Unexpected upstream tag: $TAG"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != "true" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists here, nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Building $TAG."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # GitHub disables scheduled workflows in public repos after 60 days without
+  # commits. An empty commit every ~50 days keeps the schedule alive.
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Push empty commit if repo is idle
+        run: |
+          set -euo pipefail
+          LAST=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - LAST )) -gt $(( 50 * 86400 )) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git push
+          else
+            echo "Recent activity, no keepalive needed."
+          fi
+
+  # Runs upstream code. Has no secrets and a read-only token, so nothing in the
+  # upstream build can reach the signing key.
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: refs/tags/${{ needs.check.outputs.tag }}
+          persist-credentials: false
+
+      - name: Remove memtagMode from manifest
+        run: |
+          set -euo pipefail
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          if grep -q 'android:memtagMode' "$MANIFEST"; then
+            perl -0pi -e 's/\s+android:memtagMode="[^"]*"//g' "$MANIFEST"
+          else
+            echo "::warning::memtagMode not found in $MANIFEST; upstream may have moved or dropped it."
+          fi
+          if grep -rn 'memtagMode' android/app/src; then
+            echo "::error::memtagMode is still present in the Android sources."
+            exit 1
+          fi
+          git --no-pager diff --stat
+
+      - name: Resolve Flutter version pinned by upstream
+        id: flutter
+        run: |
+          set -euo pipefail
+          SHA=$(git ls-tree HEAD .flutter | awk '{print $3}')
+          VERSION=$(git ls-remote --tags https://github.com/flutter/flutter \
+            | awk -v sha="$SHA" '$1 == sha { sub("refs/tags/", "", $2); print $2 }' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+          if [ -z "$VERSION" ]; then
+            echo "::warning::No Flutter release tag for submodule commit $SHA; using latest stable."
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          flutter-version: ${{ steps.flutter.outputs.version }}
+          cache: true
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Build unsigned APKs
+        run: |
+          set -euo pipefail
+          flutter --version
+          flutter pub get
+          APP_VERSION="$(grep '^version: ' pubspec.yaml | sed 's/version: //; s/+.*//' | head -1)"
+          DART_DEFINE="--dart-define=APP_VERSION=$APP_VERSION"
+          # Same workaround as upstream's build.sh (non-reproducible build ID in libdartjni.so).
+          for f in "${PUB_CACHE:-$HOME/.pub-cache}"/hosted/*/jni-*/src/CMakeLists.txt; do
+            [ -f "$f" ] && sed -i -E 's/^(-Wl,)(--build-id=none,)?/\1--build-id=none,/' "$f"
+          done
+          # arm64 only. --split-per-abi keeps upstream's versionCode scheme
+          # (versionCode * 10 + 3) so updates install over earlier builds.
+          flutter build apk $DART_DEFINE --split-per-abi --target-platform android-arm64 --flavor normal
+          mkdir -p "$RUNNER_TEMP/unsigned"
+          for file in build/app/outputs/flutter-apk/app-*normal*.apk; do
+            name=$(basename "$file")
+            cp "$file" "$RUNNER_TEMP/unsigned/${name//-normal/}"
+          done
+          ls -l "$RUNNER_TEMP/unsigned"
+
+      - name: Verify built APKs have no memtagMode
+        run: |
+          set -euo pipefail
+          AAPT2=$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name aapt2 -type f | sort -V | tail -1)
+          for apk in "$RUNNER_TEMP"/unsigned/*.apk; do
+            if "$AAPT2" dump xmltree --file AndroidManifest.xml "$apk" | grep -i memtag; then
+              echo "::error::$(basename "$apk") still declares memtagMode."
+              exit 1
+            fi
+            echo "OK: $(basename "$apk")"
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-apks
+          path: ${{ runner.temp }}/unsigned/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+  # Holds the signing key. Runs no upstream code, only apksigner and gh.
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: unsigned-apks
+          path: unsigned
+
+      - name: Sign APKs
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Repository secret $v is not set."
+              exit 1
+            fi
+          done
+          KEYSTORE="$RUNNER_TEMP/release.p12"
+          trap 'rm -f "$KEYSTORE"' EXIT
+          (umask 077 && printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE")
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner -type f | sort -V | tail -1)
+          mkdir signed
+          for apk in unsigned/*.apk; do
+            out="signed/$(basename "$apk")"
+            "$APKSIGNER" sign --ks "$KEYSTORE" --ks-type PKCS12 \
+              --ks-pass env:KEYSTORE_PASSWORD --ks-key-alias "$KEY_ALIAS" \
+              --out "$out" "$apk"
+            "$APKSIGNER" verify "$out"
+            sha256sum "$out" | cut -d ' ' -f 1 > "$out.sha256"
+          done
+          rm -f signed/*.idsig
+          "$APKSIGNER" verify --print-certs signed/app-arm64-v8a-release.apk \
+            | grep -m1 'certificate SHA-256 digest:' | sed 's/.*digest: //' > cert-sha256.txt
+          ls -l signed
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Obtainium $TAG built from [$UPSTREAM@$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) with \`android:memtagMode\` removed from the manifest."
+            echo
+            echo "Signing certificate SHA-256: \`$(cat cert-sha256.txt)\`"
+            echo
+            echo "| File | SHA-256 |"
+            echo "| --- | --- |"
+            for f in signed/*.apk; do
+              echo "| $(basename "$f") | \`$(cat "$f.sha256")\` |"
+            done
+          } > notes.md
+          rm -f signed/*.sha256
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" signed/*.apk --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+          else
+            gh release create "$TAG" signed/*.apk --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
+          fi
+          # Remove assets that are no longer built (e.g. from older runs).
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
+            | while read -r name; do
+                [ -f "signed/$name" ] || gh release delete-asset "$TAG" "$name" --repo "$GITHUB_REPOSITORY" --yes
+              done
